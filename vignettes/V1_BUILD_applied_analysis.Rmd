@@ -1,0 +1,447 @@
+---
+title: "Applied Analyses with BUILD"
+author: "Carter Sevick"
+output:
+   pdf_document: 
+     keep_tex: no
+     number_sections: true
+bibliography: "vigbib.bib"
+vignette: >
+  %\VignetteIndexEntry{build}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+\section{Introduction}
+
+\noindent
+This tutorial is designed for those tasked with the analysis of data derived from a secondary research study of a biobank or data repository with a binary longitudinal outcome. Participants were sampled from the repository based on an outcome dependent design (ODS) [@Sevick_paper_1; @Schildcrout_E_2018one] that constituted a stratified random sample where the strata were formed from the longitudinal outcome pattern and dropout time. At the time of sampling, the participants were missing their primary exposure of interest, which was later assigned based on evaluation of stored bio-samples. Since the data were collected longitudinally, dropout is a concern and if the nature of the outcome is such that it is associated with study dropout then analytic adjustments may be necessary to avoid bias [@Wilson_MS_Thesis_2019].
+
+\noindent
+Here we introduce the BUILD package which implements our methods for \underline{\bf B}inary outcomes \underline{\bf U}sing \underline{\bf I}nformed sampling strategies for \underline{\bf L}ongitudinal studies with non-ignorable \underline{\bf D}ropout (BUILD) as an expansion to ODS to accommodate analytical methods adjusting for non-ignorable dropout. Familiarity with the background of this method [@Sevick_paper_1] will be assumed as well as that the intent of the reader is to gain awareness of the methodology through an applied example.
+
+
+
+\noindent
+In the following sections, we will introduce our function to simulate longitudinal data with non-ignorable dropout which uses methods that have been used previously in the evaluation of methods to adjust for this effect [@Sevick_paper_1; @Hogan_B_2004; @Forster_CCT_2011;  @Moore_SMIMR_2017; @Moore_BA_2019]. Data generated will be used as grist for an example analysis using a mixture model to account for possible non-ignorable dropout adjusted for the ODS sampling design. Finally, marginal parameter effects will be computed and inference carried out using resampling.
+
+
+\subsection{Installation}
+
+The current BUILD package is available from GitHub. Before attempting installation be sure that you have the devtools package installed:
+
+
+
+```{r eval = F}
+install.packages("devtools")
+```
+
+At this point, the BUILD package may be installed with:
+
+```{r eval = F}
+
+devtools::install_github("csevick/build")
+
+```
+
+\section{A Tour of BUILD Functions for Analysis}
+
+\subsection{Data Simulation}
+
+If appropriate data is already available then this next section may be skipped and the later sections adapted (beginning with section \ref{analysis_code}). The function \textit{simuDat()} is designed to simulate a data set, with a non-ignorable dropout effect, that can be used to demonstrate the capabilities of the BUILD package. Additional information for this function is available in the documentation for the BUILD package. Here we will present it as the data source, with minimal explanation.  
+
+
+```{r}
+
+library(build)
+
+set.seed(209587)
+
+dat <- simuDat(
+    B            = c(-3,2,5,2.5,0),
+    G            = matrix(c(4), ncol = 1),
+    random       = NULL,
+    p_exposed    = 0.5,
+    p_confounder = 0.25,
+    conf         = 0,
+    N            = 5000,
+    M            = 5,
+    D_B          = c(0, -2, -1, -0.5, 0),
+    D_F          = c(1, 1, 1, 1, 1),
+    D_parms      = list(c(1,1), c(1,1.5))
+  ) 
+
+# create a subset with non-random dropout
+mdat <- subset(dat, time <= dtime)
+```
+
+\noindent
+The result is a dataframe of 5000 participants (with up-to 6 rows, for those that complete the study) where unexposed participants dropout uniformly (starting at the second follow up), but the exposed are less likely to dropout over time. The binary outcome will be generated from a model with a random intercept variance of 4 and the following structure:
+
+$$ f(y_{ij}|b_i)=-3+2t_{ij}+5x_i+2.5t_{if}x_i-2d_it_{ij}-1d_ix_i-0.5d_it_{ij}x_i+b_i$$
+```{r eval = F, include = F}
+\noindent
+Of course, the main data source is not supposed to have the exposure data. This is why we are using an outcome dependent sampling design to isolate a small subset of participants to submit to further analysis to determine their exposure status. The following, final, transformation simulates this applied situation.
+```
+
+```{r}
+# create look up table for exposure status
+## this will represent the assessment results for the selected random sample 
+exposure_status <- unique(mdat[c('id', 'exposure')])
+
+# delete exposure status from the data source (we are not supposed to know!)
+mdat <- subset(mdat, select = -exposure)
+
+```
+
+\subsection{Identifying Outcome and Dropout Strata and Drawing a Sample}
+
+\noindent
+In preparation for drawing an ODS sample with possible non-ignorable dropout, the first step is to inspect the cell counts of the outcome by dropout time strata. Recall that the outcome strata are a grouping of the sum of the longitudinal binary outcomes for each participant. Let $Y_{ij}$ and $n_i$ be the $j^{th}$ measurement and number of measurements for the $i^{th}$ participant, respectively, then stratum assigned to participant $i$ is:
+
+
+$$
+v_i = \begin{cases} {\begin{array}{cc} 1 & \sum_j y_{ij} = 0\\ 2 & \sum_j y_{ij} < n_i\\ 3 &  \sum_j y_{ij} = n_i \\ \end{array} } \end{cases}
+$$
+
+\noindent
+The function $build\_sample\_frame()$ takes a dataframe, destined for an ODS sample, and produces a 2 element list. The first element is a dataframe containing the unique individuals and their outcome and dropout time strata. The outcome strata assignment is called $oc\_strata$. The second element is a simple cross-tabulation of the strata. Both elements are needed for future steps in this process. The arguments of the function are:
+
+\begin{itemize}
+  \item ${\bf data}$: the name of a dataframe to select rows from
+  \item ${\bf study\_id}$: character, variable in the dataframe that identifies the subject
+  \item ${\bf outcome}$: character, variable in the dataframe that specifies the study outcome
+  \item ${\bf drop\_strata}$: character - variable in the dataframe that identifies the dropout strata
+\end{itemize}
+
+
+```{r}
+# create the sample frame
+s_frame <- build_sample_frame(data        = mdat
+                            , study_id    = 'id'
+                            , outcome     = 'y'
+                            , drop_strata = 'dtime')
+
+# the strata cell counts are:
+s_frame$strata_counts
+
+# the marginal outcome strata counts are:
+rowSums(s_frame$strata_counts)
+
+# the marginal dropout time strata counts are:
+colSums(s_frame$strata_counts)
+
+# the first 6 rows of the sample frame
+head(s_frame$sample_frame)
+```
+
+\noindent
+Next, we specify the sampling plan by the desired counts selected from the marginal outcome strata and then how to distribute that count across the dropout strata. The function for this task is $build\_sample\_plan()$ and has the following arguments:
+
+\begin{itemize}
+  \item ${\bf n\_samp}$: a scalar (if only specifying total desired sample size), or three element vector (if specifying marginal outcome strata sampling goal)
+  \item ${\bf N\_bystrata}$: matrix of outcome by dropout counts. dimensions must be named
+  \item ${\bf oc\_sample\_adj}$: numeric vector of dim 3. Specified only if a scalar sample size is specified. Amount to adjust the observed outcome strata proportions expressed as an odds increase in the sampling proportion of the stratum. All three may be specified and the result is standardized to the sample size requested in ${\bf n\_samp}$
+  \item ${\bf drop\_grad}$: numeric scalar. a value of one will indicate proportional sampling across the dropout strata. a non-zero value is a slope (expressed as an odds ratio) to adjust the sampling gradient across dropout strata.
+\end{itemize}
+
+\noindent
+The function outputs are a list with:
+
+\begin{enumerate}
+  \item ${\bf sample\_plan}$: a data frame specifying the sample sizes and probabilities for selection from each strata
+  \item ${\bf P\_matrix}$: A matrix of sampling probabilities from the strata
+  \item ${\bf N\_sample}$: A matrix of sampling sample sizes from the strata
+\end{enumerate}
+
+\noindent
+If the sample sizes from the marginal outcome strata are known and proportionate sampling across the dropout strata is desired then the following will create the sampling plan for selection of the sample data. A sampling plan selecting 75, 450 and 75 participants from strata 1, 2, and 3, respectively, is referred to as [75, 450, 75].
+
+```{r}
+
+# create the sampling plan: marginal outcome samples at [75, 450, 75]
+s_plan <- build_sample_plan(n_samp     = c(75, 450, 75)
+                          , N_bystrata = s_frame$strata_counts
+                          , drop_grad  = 1
+                            )
+
+# the [75, 450, 75] participants are distributed as:
+s_plan$N_sample
+```
+
+\noindent
+More detail on how to use the $drop\_grad$ argument can be found in the documentation and there is an additional function in the package to assist in selecting values for the $drop\_grad$ and $oc\_sample\_adj$ arguments, however that is reserved for future vignettes. 
+
+\noindent
+The sampling plan is now defined and we may move on to selecting the sample for which the participant exposure status will be determined. The function $strat\_samp()$ is designed to select stratified random samples in two different ways. First, selection can be set to randomly select a set number from each strata, this yields a predictable sample size. Alternatively, participants can be selected with a set probability, leading to variable sample sizes. The arguments are:
+
+\begin{itemize}
+  \item ${\bf df}$: the name of a dataframe to select rows from
+  \item ${\bf oc\_strata}$: character, variable in the dataframe that specifies the outcome strata membership
+  \item ${\bf drop\_strata}$: character, variable in the dataframe that specifies the dropout strata membership
+  \item ${\bf sample\_plan}$: dataframe - contains the sampling plan from ${\bf build\_sample\_plan}$ 
+  \item ${\bf sample\_by}$: (p/n) specify whether to sample by counts or probability (default is `n')
+\end{itemize}
+
+\noindent
+The output is a dataframe selected from $df$ with an additional column specifying the sampling weight ($sampWT$) of the selected participant.
+
+```{r}
+# draw the stratified sample
+set.seed(4580978)
+sample_subj <- strat_samp(df = s_frame$sample_frame
+                          , oc_strata = 'oc_strata'
+                          , drop_strata = 'dtime'
+                          , sample_plan = s_plan$sample_plan
+                          , sample_by = 'n')
+
+# The first 6 rows from the data frame holding the selected participants
+head(sample_subj)
+```
+
+\noindent
+Now that the sample of participants has been selected, the stored bio-samples are submitted for additional analysis to determine exposure. To simulate this the selected subjects are merged with the exposure dataset, created earlier. 
+
+```{r}
+# get exposure status
+sample_subj <- merge(sample_subj, exposure_status, by = 'id')
+
+```
+
+```{r eval = F, include = F}
+
+\noindent
+In the final step, prior to analysis the selected participants are reunited with their longitudinal data, along with the newly derived exposure variable and sampling weights, and statistical analyses can begin.
+```
+
+
+```{r}
+sample <- merge(mdat
+              , sample_subj[, c('id'
+                              , 'oc_strata'
+                              , 'drop_strata'
+                              , 'sampWT'
+                              , 'exposure')]
+              , by = 'id')
+
+# sort for good form
+sample <- sample[order(sample$id, sample$time),]
+
+
+```
+
+\subsection{Analysis of the Sample Data}
+\label{analysis_code}
+
+\noindent
+The \textit{lin\_mix()} function is the main analytic tool of the BUILD package. Adjustment for the sampling design can be done with ascertainment adjusted maximum likelihood (ACML) or by inverse probability of selection weighted maximum likelihood (WL). It is also integral to the multiple imputation algorithms supplied by the package. 
+
+\noindent
+This function estimates a generalized linear mixed model with a logit link and binomial distribution. The R optim function [@R_software] is used to optimize the likelihood with the BFGS method. Integration of the likelihood function is by Gauss-Hermite quadrature  [@McCulloch_A_2008]. Robust variances are available for the fixed effects, if needed [@rabehasketh2006]. At present, clustering is limited to one level but any number of random effects may be included, up to computational capacity, and available correlation structures are diagonal and unstructured.
+
+\noindent
+The following function call fits a random intercept model with fixed effects for time, exposure and their interaction. The additional fixed effects for dropout (dtime and dtime interactions with the other fixed effects) are the components necessary to fit a conditional linear model (CLM) [@Wu_B_1989], which assumes that the relationship between dropout and the fixed effects assumed to be affected by dropout is linear. This function has many arguments so we will introduce them as needed. The documentation has a thorough presentation of all arguments.
+
+\begin{itemize}
+  \item ${\bf df}$: a data frame
+  \item ${\bf fixed}$: formula for the fixed effect portion of the model
+  \item ${\bf random}$: formula for the random effect portion of the model 
+  \item ${\bf cluster}$: character - name of the variable in df that defines a cluster
+  \item ${\bf sweights}$: character - name of the variable in df that holds sampling weights (cluster level only)
+  \item ${\bf robust}$: boolean - if true then compute robust variances for the fixed effects
+  \item ${\bf qpoints}$: numeric scalar - number of quadrature points to use when integrating the likelihood
+\end{itemize}
+
+```{r}
+
+# fit the model
+WL_fit <- logit_mix(df = sample 
+                  , fixed = y ~ time + exposure + time:exposure +
+                                dtime + time:dtime + exposure:dtime + 
+                                time:exposure:dtime
+                  , random = ~ 1
+                  , cluster = 'id'
+                  , sweights = 'sampWT'
+                  , robust = T
+                  , qpoints = 20
+                  )
+
+# fixed effect estimates
+knitr::kable(WL_fit$fixed, digits = 2)
+```
+
+
+\noindent
+In this example, dropout time is discrete thus we can compute marginal (expected) parameters (with respect to dropout) as a the mean of the dropout specific slopes taken over the empirical distribution of dropout time. The complexity of this computation is proportional to the dependencies we assume for the empirical distribution of dropout time, and for this example we will assume dependency on exposure status.
+
+\noindent
+The empirical distribution of dropout time, conditional on exposure is:
+
+For the unexposed:
+```{r}
+
+edist0 <- with(subset(sample_subj, exposure == 0), table(dtime)/length(dtime))
+edist0
+```
+
+For the exposed:
+```{r}
+
+edist1 <- with(subset(sample_subj, exposure == 1), table(dtime)/length(dtime))
+edist1
+```
+
+\noindent
+Our marginal parameters of interest are the slope in the unexposed and exposed groups as well as the slope difference. Had no difference, by exposure status, in the empirical distribution of dropout time been assumed we could simply have computed the marginal time by exposure interaction term. However, assuming the distribution differs, the difference in slopes must be computed explicitly since the two will be different and carry different interpretations. For code reuse, we will code the computations into a function:
+
+```{r}
+
+slope_n_diff <- function(fit_obj) {
+  
+  # compute empirical dropout time distributions
+  edist0 <- with(subset(fit_obj$data, exposure == 0 & time == 0)
+               , table(dtime)/length(dtime))
+  edist1 <- with(subset(fit_obj$data, exposure == 1 & time == 0)
+               , table(dtime)/length(dtime))
+
+  # extract fixed effects
+  feff <- fit_obj$fixed$estimate
+  names(feff) <- row.names(fit_obj$fixed)
+  
+  # unique ordered dropout times
+  dtimes <- unique(fit_obj$data$dtime)
+  dtimes <- sort(dtimes)
+  
+  # compute marginal effects
+  results <- data.frame(
+    slope_unexposed = feff['time'] + edist0 %*% dtimes * feff['time:dtime']
+  , slope_exposed = feff['time'] + feff['time:exposure'] + 
+                    edist1 %*% dtimes * feff['time:dtime'] + 
+                    edist1 %*% dtimes * feff['time:exposure:dtime']
+  )
+  
+  results$slope_diff <- with(results, slope_exposed - slope_unexposed)
+  
+  return(results)
+
+}
+
+# compute the observed marginal slopes and slope difference
+obs_splope_n_diff <- slope_n_diff(WL_fit)
+obs_splope_n_diff
+```
+
+\noindent
+Variances can be computed using the delta method, however, in an applied setting there are two issues to consider. First, the delta method approximation is only good to the degree that our model assumptions have been satisfied. Second, if the sample is sparsely distributed over many dropout time levels the delta method approximation will be poor [@Hogan_B_2004; @Hogan_SiM_2004]. Due to these considerations we recommend resampling methods, such as the bootstrap [@davison1997; @shao_jackknife_1995], for general use. A simple bootstrap procedure, where rows are selected independently, would be inappropriate here and lead to variance estimates that are far too small. The correct bootstrap procedure will reflect the sampling procedure and, for ODS, this is a stratified cluster sample. The BUILDER function \textit{strata\_clus\_boot()} was designed to facilitate this for a BUILD analysis. It accepts a data frame and returns a single bootstrap sample, based on specified strata and cluster identifiers. In addition, the new dataframe will contain a pseudo cluster identifier (\textit{.ClusID.}) that will need to be used in cluster based analysis in place of the original identifier. The arguments of the function are:
+
+\begin{itemize}
+  \item ${\bf df}$: a dataframe to select a bootstrap sample from 
+  \item ${\bf strata}$: character, name of a variable that defines stratum  membership 
+  \item ${\bf cluster}$: character, name of a variable that defines cluster membership 
+\end{itemize}
+
+\noindent
+Bootstrap analyses are computationally intensive and BUILD models can be complex. Together, CPU time may be prohibitive. Parallel processing will be effective in reducing computation time and is simple to implement using th doParallel package [@r_package_doparallel]. In addition, the doRNG package [@r_package_dorng] allows the seamless use of seed values for reproducibility when parallel processing is used. Here is an example bootstrap analysis analysis.
+
+```{r}
+
+# function to carryout a single analysis
+boot_fun <- function(data) {
+  
+  #draw a bootstrap sample
+  B <- strata_clus_boot(df = data
+                      , strata = c('oc_strata','dtime')
+                      , cluster = 'id')
+  # fit the model
+  ## note: robust standard errors are intensive and not needed in a bootstrap analysis
+  B_WL_fit <- logit_mix(df = B
+                      , fixed = y ~ time + exposure + time:exposure +
+                                    dtime + time:dtime + exposure:dtime + 
+                                    time:exposure:dtime
+                      , random = ~ 1
+                      , cluster = '.ClusID.'
+                      , sweights = 'sampWT'
+                      , robust = F
+                      , qpoints = 20
+                      )
+
+  return(slope_n_diff(B_WL_fit))
+}
+
+boot_fun(sample)
+```
+
+\noindent
+Next the process is iterated in parallel. Note that the analysis is set for only 100 bootstrap iterations for brevity in run time, but in an actual analysis this number would be based on an evaluation of the bootstrap distribution and desired precision.
+
+```{r warning=F, message=F}
+library(doParallel)
+library(doRNG)
+
+# set up a cluster
+n_cores <- detectCores() - 1
+registerDoParallel(cores = n_cores)
+  
+# set the number of bootstrap iterations
+n_boots <- 100
+system.time({
+B_result <- foreach(1:n_boots
+                 , .packages = c('build')
+                 , .options.RNG = 4879549
+                 , .combine = 'rbind'
+) %dorng% {
+  boot_fun(sample)
+}
+})
+
+#stop the cluster
+stopImplicitCluster()
+
+# compute bootstrap SE's
+bse <- sqrt(diag(var(B_result)))
+
+# compute test statistics
+Z <- obs_splope_n_diff / bse
+
+# compute p-values
+p_val <- sapply(Z, function(Z) {pchisq(q = Z^2, df = 1, lower.tail = F)})
+
+# compute 95% confidence limits
+lcl <- obs_splope_n_diff - qnorm(0.975)*bse
+ucl <- obs_splope_n_diff + qnorm(0.975)*bse
+
+# summary table
+boot_tab <- data.frame(
+  estimate = t(obs_splope_n_diff)
+ ,lcl_95 = t(lcl)
+ ,ucl_95 = t(ucl)
+ ,pvalue = format.pval(p_val, eps=0.001, digits = 2)
+)
+row.names(boot_tab) <- names(obs_splope_n_diff)
+knitr::kable(boot_tab
+             , digits = 2
+             , caption = 'Results of bootstap analysis of marginal parameters')
+```
+
+\noindent
+This example assumes that the bootstrap distribution is normal. This may be a safe assumption when the data source is large, but the bootstrap distributions should always be inspected to ensure that they meet this assumption. Statistics computed for small categories, in otherwise large data sets, may also exhibit non-normality. When normality is in question percentile bootstrap intervals or other advances methods, such as bias-corrected and Accelerated (BCa), may be advisable [@davison1997].
+
+\section{Discussion}
+
+\noindent
+Nonignorable dropout is a potential concern for longitudinal studies. There are well developed methods for exposure based sampling and randomized designs to obtain adjusted analyses, but until now, not for informed sampling strategies. This tutorial has introduces the BUILD package implementing our expansion to outcome dependent sampling to accommodate dropout effects. The use of mixture models allows a solution that does not require distributional assumptions on the dropout distribution [@Verbeke_A_2000] and is readily extensible to cover a wide variety of dropout associations and even multiple dropout reasons [@Moore_R_package; @Moore_SMIMR_2017; @Moore_BA_2019; @Moore_BMC_MRMeth_2020].
+
+\noindent
+The increased rate of storage of biosamples with longitudinal studies is of great importance to biomedical research but the lack of tools to leverage these data sources has been a significant barrier to increased utilization. BUILD is a flexible and powerful solution which will aid investigators to develop informative studies with these valuable resources. 
+
+
+\newpage
+\bibliography{vigbib}
+

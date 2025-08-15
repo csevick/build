@@ -1,0 +1,16 @@
+Package: build
+Title: Outcome Dependent Sampling and Analysis of Longitudinal Data with Correction for Nonignorable Dropout
+Version: 0.0.0.9000
+Authors@R: c(
+    person(given = "Carter", family = "Sevick", email = "carter.sevick@cuanschutz.edu", role = c("aut", "cre")),
+    person(given = "Camille", family = "Moore", email = "mooreca@njhealth.org", role = c("ths")),
+    person(given = "Samantha", family = "MaWhinney", email = "sam.mawhinney@cuanschutz.edu", role = c("ths"))
+  )
+Description: Provides tools to select, and analyze, outcome dependent samples of longitudinal data with corrections for nonignorable dropout.
+License: GPL (>= 3)
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2
+VignetteBuilder: knitr
+Suggests: knitr, rmarkdown, build
+Imports: doParallel, doRNG, numDeriv
